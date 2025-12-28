@@ -1,0 +1,4 @@
+*.mp4
+*json
+*.pth
+__pycache__/
