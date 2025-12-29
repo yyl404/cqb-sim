@@ -8,7 +8,7 @@ import cv2
 class CQBConfig:
     # --- 环境尺寸 ---
     H, W = 100, 100  # 地图尺寸
-    L = 20           # 局部观测裁剪尺寸 (20x20)
+    L = 200          # 局部观测裁剪尺寸
     DT = 0.05        # 时间步长 (s)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -96,274 +96,342 @@ class CQBSimulator:
 
     def _generate_map(self):
         """
-        基于二叉空间分割 (BSP) 生成类室内结构地图 (CQB风格)
-        满足：水平垂直墙体、连通性、对称出生点
+        全新逻辑：网格化 -> 区域合并 -> 连通性生长 -> 渲染
         """
-        # 尝试生成直到满足连通性（BSP通常是连通的，防止意外）
-        max_retries = 10
-        for _ in range(max_retries):
-            # 1. 初始化全墙壁
-            self.grid_np = np.ones((CFG.H, CFG.W), dtype=np.uint8)
-            
-            # 2. BSP 分割参数
-            min_node_size = 15 # 分割区域的最小尺寸
-            padding = 2        # 墙壁保留厚度
-            
-            # 根节点
-            root = {'x': 0, 'y': 0, 'w': CFG.W, 'h': CFG.H}
-            nodes = [root]
-            
-            # 递归分割
-            for _ in range(4): # 分割层数，4层大约生成 16 个区域
-                new_nodes = []
-                for node in nodes:
-                    # 尝试分割
-                    split_success = False
-                    # 随机决定横切还是竖切
-                    if np.random.rand() > 0.5: # 尝试竖切
-                        # --- 修改点 1: 将 >= 改为 >，防止 randint(low, low) 报错 ---
-                        if node['w'] > min_node_size * 2:
-                            split_x = np.random.randint(min_node_size, node['w'] - min_node_size)
-                            child1 = {'x': node['x'], 'y': node['y'], 'w': split_x, 'h': node['h']}
-                            child2 = {'x': node['x'] + split_x, 'y': node['y'], 'w': node['w'] - split_x, 'h': node['h']}
-                            # 记录走廊连接点 (中心)
-                            self._create_corridor(child1, child2, 'vertical')
-                            new_nodes.extend([child1, child2])
-                            split_success = True
-                    
-                    if not split_success: # 尝试横切
-                        # --- 修改点 2: 将 >= 改为 >，防止 randint(low, low) 报错 ---
-                        if node['h'] > min_node_size * 2:
-                            split_y = np.random.randint(min_node_size, node['h'] - min_node_size)
-                            child1 = {'x': node['x'], 'y': node['y'], 'w': node['w'], 'h': split_y}
-                            child2 = {'x': node['x'], 'y': node['y'] + split_y, 'w': node['w'], 'h': node['h'] - split_y}
-                            self._create_corridor(child1, child2, 'horizontal')
-                            new_nodes.extend([child1, child2])
-                            split_success = True
-                    
-                    if not split_success:
-                        new_nodes.append(node) # 无法分割，保留
-                nodes = new_nodes
-
-            # 3. 在每个叶子节点生成房间
-            for node in nodes:
-                # 随机缩小房间尺寸，形成墙壁厚度
-                # 确保房间不贴边，留出最外层围墙
-                # 即使 node['w'] 很小，也要保证 randint 合法
-                max_padding_x = max(padding + 1, node['w'] // 4)
-                # 再次防护：如果计算出的 high <= low，强制设为 low+1
-                if max_padding_x <= padding: max_padding_x = padding + 1
-                
-                room_x = node['x'] + np.random.randint(padding, max_padding_x)
-                
-                max_padding_y = max(padding + 1, node['h'] // 4)
-                if max_padding_y <= padding: max_padding_y = padding + 1
-                
-                room_y = node['y'] + np.random.randint(padding, max_padding_y)
-                
-                room_w = max(4, node['w'] - (room_x - node['x']) - padding)
-                room_h = max(4, node['h'] - (room_y - node['y']) - padding)
-                
-                # 边界检查
-                if room_x + room_w >= CFG.W: room_w = CFG.W - 1 - room_x
-                if room_y + room_h >= CFG.H: room_h = CFG.H - 1 - room_y
-                
-                # 挖空房间 (0)
-                self.grid_np[room_y:room_y+room_h, room_x:room_x+room_w] = 0
-                
-                # 4. 在房间内添加点缀障碍物 (Table/Pillar)
-                if room_w > 6 and room_h > 6 and np.random.rand() > 0.3:
-                    self._add_room_obstacle(room_x, room_y, room_w, room_h)
-
-            # 5. 强制边界围墙
-            self.grid_np[0:2, :] = 1
-            self.grid_np[-2:, :] = 1
-            self.grid_np[:, 0:2] = 1
-            self.grid_np[:, -2:] = 1
-            
-            # 6. 连通性检查
-            if self._check_connectivity():
-                break
+        # 1. 构造不均匀网格 (Lattice Generation)
+        # x_coords, y_coords 存储的是网格线的像素坐标
+        x_coords = self._generate_grid_lines(CFG.W)
+        y_coords = self._generate_grid_lines(CFG.H)
         
+        rows = len(y_coords) - 1
+        cols = len(x_coords) - 1
+        
+        # 2. 初始化墙壁数据结构
+        # v_walls[r][c] 代表格子(r,c)左侧的墙 (最后一列多一个边界墙)
+        # h_walls[r][c] 代表格子(r,c)上侧的墙 (最后一行多一个边界墙)
+        # 状态: 1=Wall, 0=Merged(No Wall), 2=Door
+        self.v_walls = np.ones((rows, cols + 1), dtype=np.int8)
+        self.h_walls = np.ones((rows + 1, cols), dtype=np.int8)
+        
+        # 辅助：记录每个格子属于哪个“房间ID” (用于合并逻辑)
+        # 初始时，每个格子都是独立的房间
+        self.cell_group_id = np.arange(rows * cols).reshape(rows, cols)
+        
+        # 3. 随机合并房间 (Merge Step)
+        # 尝试多次合并，生成多个不规则大厅
+        num_merges = int(rows * cols * 0.2) # 尝试合并的次数
+        for _ in range(num_merges):
+            self._merge_random_cluster(rows, cols)
+            
+        # 4. 确定出生点 (大致对称)
+        # 随机选一个非边缘的格子作为A
+        spawn_r_a = np.random.randint(1, rows - 1)
+        spawn_c_a = np.random.randint(1, cols - 1)
+        # 对称点作为B
+        spawn_r_b = rows - 1 - spawn_r_a
+        spawn_c_b = cols - 1 - spawn_c_a
+        
+        # 记录出生点矩形范围 (用于后续逻辑，虽然题目说忽略要求，但我们需要坐标来放人)
+        # 获取格子实际像素坐标
+        self.spawn_rect_a = self._get_cell_rect(spawn_r_a, spawn_c_a, x_coords, y_coords)
+        self.spawn_rect_b = self._get_cell_rect(spawn_r_b, spawn_c_b, x_coords, y_coords)
+
+        # 5. 连通性生长 (Connectivity Step)
+        # 从 A 出发，打通去往所有房间的路
+        self._ensure_connectivity_from_spawn(spawn_r_a, spawn_c_a, rows, cols)
+        
+        # 6. 渲染到 Grid (Rendering)
+        self.grid_np = np.zeros((CFG.H, CFG.W), dtype=np.uint8)
+        self._render_grid(x_coords, y_coords)
+        
+        # 7. 强制外墙封闭 (Boundary)
+        self.grid_np[0, :] = 1
+        self.grid_np[-1, :] = 1
+        self.grid_np[:, 0] = 1
+        self.grid_np[:, -1] = 1
+
         # 转为 Tensor
         self.map = torch.tensor(self.grid_np, device=CFG.DEVICE, dtype=torch.float32)
-        
-        # 确定出生点模式
-        self._determine_spawn_points()
 
-    def _create_corridor(self, node1, node2, direction):
-        """连接两个区域的走廊"""
-        # 计算两个区域的中心
-        c1_x, c1_y = node1['x'] + node1['w']//2, node1['y'] + node1['h']//2
-        c2_x, c2_y = node2['x'] + node2['w']//2, node2['y'] + node2['h']//2
-        
-        # 走廊宽度随机
-        thickness = np.random.randint(2, 4)
-        
-        x_min, x_max = min(c1_x, c2_x), max(c1_x, c2_x)
-        y_min, y_max = min(c1_y, c2_y), max(c1_y, c2_y)
-        
-        # 在 grid 上挖出走廊 (0)
-        # 注意：走廊可能会被后来的墙壁覆盖，所以我们在生成房间前先记录连接关系，
-        # 或者简单的：我们在这一步直接挖空。为了保证连通，我们在生成房间后，如果走廊被堵，BSP通常能保证
-        # 但这里简单的做法是：先挖走廊。
-        
-        # 修正：为了保证走廊不被随机缩小的房间完全切断，我们通常在最后画走廊，或者
-        # 在这里画，但要保证后续房间生成时会覆盖到走廊的端点。
-        # 简化版：直接画直线，连接中心。
-        
-        if direction == 'vertical': # 左右分割，画横向走廊
-            # 稍微随机一点 y 位置，不一定要正中心
-            y = c1_y
-            self.grid_np[y-thickness//2 : y+thickness//2+1, x_min:x_max] = 0
-        else: # 上下分割，画纵向走廊
-            x = c1_x
-            self.grid_np[y_min:y_max, x-thickness//2 : x+thickness//2+1] = 0
+    def _generate_grid_lines(self, length):
+        """在纵向或横向生成随机间隔的分割线"""
+        coords = [0]
+        while coords[-1] < length:
+            # 间隔 10 - 20
+            step = np.random.randint(10, 21)
+            next_pos = coords[-1] + step
+            if next_pos >= length - 10: # 如果剩余空间太小，直接吸附到边界
+                coords.append(length)
+                break
+            coords.append(next_pos)
+        return coords
 
-    def _add_room_obstacle(self, rx, ry, rw, rh):
-        """在房间内添加障碍物"""
-        obs_type = np.random.choice(['rect', 'circle'])
+    def _get_cell_rect(self, r, c, x_coords, y_coords):
+        """获取网格单元的像素范围 (x, y, w, h)"""
+        x = x_coords[c]
+        y = y_coords[r]
+        w = x_coords[c+1] - x
+        h = y_coords[r+1] - y
+        return (x, y, w, h)
+
+    def _merge_random_cluster(self, rows, cols):
+        """随机选择一个点，向外合并最多5个格子形成不规则房间"""
+        # 随机种子点
+        start_r = np.random.randint(0, rows)
+        start_c = np.random.randint(0, cols)
+        target_group = self.cell_group_id[start_r, start_c]
         
-        cx, cy = rx + rw//2, ry + rh//2
+        current_cluster = [(start_r, start_c)]
+        max_size = np.random.randint(2, 6) # 大小 2-5
         
-        if obs_type == 'rect':
-            # 矩形障碍物 (如桌子)
-            w = np.random.randint(2, max(3, rw//3))
-            h = np.random.randint(2, max(3, rh//3))
-            # 随机位置
-            ox = np.random.randint(rx+1, rx+rw-w)
-            oy = np.random.randint(ry+1, ry+rh-h)
-            self.grid_np[oy:oy+h, ox:ox+w] = 1
+        # 简单的广度/随机优先搜索来吸纳邻居
+        candidates = []
+        self._add_neighbors(start_r, start_c, rows, cols, candidates)
+        
+        while len(current_cluster) < max_size and candidates:
+            # 随机选一个邻居
+            idx = np.random.randint(len(candidates))
+            nr, nc, wall_type = candidates.pop(idx)
             
-        elif obs_type == 'circle':
-            # 圆形障碍物 (如柱子)
-            radius = np.random.randint(1, max(2, min(rw, rh)//5))
-            # 简单的圆形填充
-            y_indices, x_indices = np.ogrid[:CFG.H, :CFG.W]
-            mask = (x_indices - cx)**2 + (y_indices - cy)**2 <= radius**2
-            self.grid_np[mask] = 1
+            # 如果这个邻居还没被归类到当前组 (避免重复合并)
+            # 注意：这里我们允许合并不同的Group，从而让小房间变成大房间
+            if self.cell_group_id[nr, nc] != target_group:
+                # 1. 拆墙
+                if wall_type == 'h': # (nr, nc) 在 (r, c) 下方或上方，看坐标
+                    # 确定墙的坐标。墙的索引通常取较大的那个（下侧墙或右侧墙）
+                    wr = max(nr, current_cluster[-1][0]) # 简化逻辑，重新判断方向
+                    if nr > current_cluster[-1][0]: self.h_walls[nr][nc] = 0 # 下邻居，墙在nr
+                    else: self.h_walls[nr+1][nc] = 0 # 上邻居，墙在nr+1 (即current的上方)
+                    # 修正逻辑：更严谨的判断
+                    r_old, c_old = self._find_adj_cell(nr, nc, current_cluster)
+                    if r_old < nr: self.h_walls[nr][nc] = 0 # Down
+                    else: self.h_walls[r_old][nc] = 0 # Up
+                else: # Vertical
+                    r_old, c_old = self._find_adj_cell(nr, nc, current_cluster)
+                    if c_old < nc: self.v_walls[nr][nc] = 0 # Right
+                    else: self.v_walls[nr][c_old] = 0 # Left
 
-    def _check_connectivity(self):
-        """检查是否有隔绝区域，并剔除小的死区"""
-        empty_space = (self.grid_np == 0).astype(np.uint8)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(empty_space, connectivity=4)
-        
-        if num_labels <= 1: return False # 全是墙
-        
-        # 找到最大的空地
-        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-        
-        # 如果最大区域太小（比如生成失败），重试
-        if stats[largest_label, cv2.CC_STAT_AREA] < (CFG.H * CFG.W * 0.2):
-            return False
+                # 2. 统一 Group ID
+                # 将该邻居原来的 group id 全部替换为 target_group
+                old_id = self.cell_group_id[nr, nc]
+                self.cell_group_id[self.cell_group_id == old_id] = target_group
+                
+                current_cluster.append((nr, nc))
+                self._add_neighbors(nr, nc, rows, cols, candidates)
 
-        # 填平所有非最大区域
-        new_grid = np.ones_like(self.grid_np)
-        new_grid[labels == largest_label] = 0
-        self.grid_np = new_grid
-        return True
+    def _find_adj_cell(self, r, c, cluster):
+        """在cluster中找到与(r,c)相邻的那个格子用于确定墙的位置"""
+        for pr, pc in cluster:
+            if abs(pr - r) + abs(pc - c) == 1:
+                return pr, pc
+        return r, c # Should not happen
 
-    def _determine_spawn_points(self):
-        """确定对称的出生点"""
-        modes = ['diagonal_tl_br', 'diagonal_tr_bl', 'horizontal', 'vertical']
-        mode = np.random.choice(modes)
+    def _add_neighbors(self, r, c, rows, cols, list_ref):
+        # 上
+        if r > 0: list_ref.append((r-1, c, 'h'))
+        # 下
+        if r < rows - 1: list_ref.append((r+1, c, 'h'))
+        # 左
+        if c > 0: list_ref.append((r, c-1, 'v'))
+        # 右
+        if c < cols - 1: list_ref.append((r, c+1, 'v'))
+
+    def _ensure_connectivity_from_spawn(self, start_r, start_c, rows, cols):
+        """
+        从出生点所在的 Group 开始，使用 Prim 算法思想向外扩展，
+        直到所有格子都被访问（连通）。
+        """
+        # 1. 找到出生点所在的 Group ID
+        start_group = self.cell_group_id[start_r, start_c]
         
-        padding = 5
-        cx, cy = CFG.W // 2, CFG.H // 2
+        # 2. 初始化已访问的 Group 集合
+        visited_groups = {start_group}
         
-        # 预设几个可能的出生中心点
-        pts = {
-            'tl': (padding + 5, padding + 5),          # 左上
-            'tr': (CFG.W - padding - 5, padding + 5),  # 右上
-            'bl': (padding + 5, CFG.H - padding - 5),  # 左下
-            'br': (CFG.W - padding - 5, CFG.H - padding - 5), # 右下
-            'lc': (padding + 5, cy),                   # 左中
-            'rc': (CFG.W - padding - 5, cy),           # 右中
-            'tc': (cx, padding + 5),                   # 上中
-            'bc': (cx, CFG.H - padding - 5)            # 下中
-        }
+        # 3. 前线墙壁列表：(r_from, c_from, r_to, c_to, wall_type, wall_r, wall_c)
+        # 存储所有连接 "已访问区域" 和 "未访问区域" 的实体墙壁
+        frontier_walls = []
         
-        if mode == 'diagonal_tl_br':
-            self.spawn_center_a = pts['tl']
-            self.spawn_center_b = pts['br']
-        elif mode == 'diagonal_tr_bl':
-            self.spawn_center_a = pts['tr']
-            self.spawn_center_b = pts['bl']
-        elif mode == 'horizontal':
-            self.spawn_center_a = pts['lc']
-            self.spawn_center_b = pts['rc']
-        elif mode == 'vertical':
-            self.spawn_center_a = pts['tc']
-            self.spawn_center_b = pts['bc']
+        # 将初始 Group 的所有对外墙壁加入前线
+        # 遍历全图太慢，我们先找到属于 start_group 的所有格子
+        # (简单起见，这里做一个全图扫描初始化，对于100x100来说很快)
+        # 或者更优：直接用 BFS 收集
+        self._add_group_walls_to_frontier(start_group, rows, cols, frontier_walls, visited_groups)
+        
+        total_groups = len(np.unique(self.cell_group_id))
+        
+        while len(visited_groups) < total_groups and frontier_walls:
+            # 随机选一面墙
+            idx = np.random.randint(len(frontier_walls))
+            w_info = frontier_walls.pop(idx) # 移除
+            rf, cf, rt, ct, wtype, wr, wc = w_info
             
-        # 确保出生点及其周围的一小块区域是空的
-        self._clear_spawn_area(self.spawn_center_a)
-        self._clear_spawn_area(self.spawn_center_b)
+            target_group = self.cell_group_id[rt, ct]
+            
+            if target_group in visited_groups:
+                continue # 墙对面已经被连通了，跳过
+            
+            # --- 打通这面墙 (生成门) ---
+            if wtype == 'h':
+                self.h_walls[wr][wc] = 2 # 2 代表 Door
+            else:
+                self.v_walls[wr][wc] = 2
+                
+            # --- 标记新 Group 为已访问 ---
+            visited_groups.add(target_group)
+            
+            # --- 将新 Group 的对外墙壁加入前线 ---
+            self._add_group_walls_to_frontier(target_group, rows, cols, frontier_walls, visited_groups)
 
-    def _clear_spawn_area(self, center, radius=3):
-        cx, cy = int(center[0]), int(center[1])
-        x_min = max(1, cx - radius)
-        x_max = min(CFG.W - 1, cx + radius)
-        y_min = max(1, cy - radius)
-        y_max = min(CFG.H - 1, cy + radius)
+    def _add_group_walls_to_frontier(self, group_id, rows, cols, frontier, visited_set):
+        """找到属于 group_id 的所有格子的对外墙壁"""
+        # 找到所有属于该组的格子坐标
+        # mask = (self.cell_group_id == group_id)
+        # rs, cs = np.where(mask)
+        # 上面方法在循环里可能慢，这里用遍历优化：
+        # 由于我们是逐步扩展，只需要扫描 target_group 包含的格子。
+        # 这里为了代码简洁，直接遍历整个 group_id 的格子列表
         
-        # 强制挖空
-        self.grid_np[y_min:y_max, x_min:x_max] = 0
-        # 更新 map tensor
-        self.map = torch.tensor(self.grid_np, device=CFG.DEVICE, dtype=torch.float32)
+        rs, cs = np.where(self.cell_group_id == group_id)
+        for i in range(len(rs)):
+            r, c = rs[i], cs[i]
+            
+            # 检查四个方向
+            # 上
+            if r > 0:
+                neighbor_group = self.cell_group_id[r-1, c]
+                if neighbor_group not in visited_set:
+                    # 只有当这里是实墙时才添加 (如果是0说明内部合并了)
+                    if self.h_walls[r][c] == 1:
+                        frontier.append((r, c, r-1, c, 'h', r, c))
+            # 下
+            if r < rows - 1:
+                neighbor_group = self.cell_group_id[r+1, c]
+                if neighbor_group not in visited_set:
+                    if self.h_walls[r+1][c] == 1:
+                        frontier.append((r, c, r+1, c, 'h', r+1, c))
+            # 左
+            if c > 0:
+                neighbor_group = self.cell_group_id[r, c-1]
+                if neighbor_group not in visited_set:
+                    if self.v_walls[r][c] == 1:
+                        frontier.append((r, c, r, c-1, 'v', r, c))
+            # 右
+            if c < cols - 1:
+                neighbor_group = self.cell_group_id[r, c+1]
+                if neighbor_group not in visited_set:
+                    if self.v_walls[r][c+1] == 1:
+                        frontier.append((r, c, r, c+1, 'v', r, c+1))
+
+    def _render_grid(self, x_coords, y_coords):
+        """将逻辑墙壁渲染到 grid_np"""
+        rows = len(y_coords) - 1
+        cols = len(x_coords) - 1
+        
+        # 渲染横向墙 (h_walls)
+        # h_walls[r][c] 对应 y_coords[r] 这条线，从 x_coords[c] 到 x_coords[c+1]
+        for r in range(rows + 1):
+            y = y_coords[r]
+            # 防止越界
+            if y >= CFG.H: y = CFG.H - 1
+            
+            for c in range(cols):
+                status = self.h_walls[r][c]
+                x_start = x_coords[c]
+                x_end = x_coords[c+1]
+                
+                if status == 1: # Wall
+                    self.grid_np[y, x_start:x_end] = 1
+                elif status == 2: # Door
+                    self.grid_np[y, x_start:x_end] = 1 # 先画墙
+                    # 挖门
+                    door_size = np.random.randint(3, 6) # 3-5
+                    segment_len = x_end - x_start
+                    if segment_len > door_size:
+                        door_start = x_start + np.random.randint(1, segment_len - door_size)
+                        self.grid_np[y, door_start : door_start+door_size] = 0
+                    else:
+                        # 墙太短直接全挖了
+                        self.grid_np[y, x_start:x_end] = 0
+
+        # 渲染纵向墙 (v_walls)
+        for r in range(rows):
+            y_start = y_coords[r]
+            y_end = y_coords[r+1]
+            
+            for c in range(cols + 1):
+                x = x_coords[c]
+                if x >= CFG.W: x = CFG.W - 1
+                
+                status = self.v_walls[r][c]
+                
+                if status == 1: # Wall
+                    self.grid_np[y_start:y_end, x] = 1
+                elif status == 2: # Door
+                    self.grid_np[y_start:y_end, x] = 1
+                    door_size = np.random.randint(3, 6)
+                    segment_len = y_end - y_start
+                    if segment_len > door_size:
+                        door_start = y_start + np.random.randint(1, segment_len - door_size)
+                        self.grid_np[door_start : door_start+door_size, x] = 0
+                    else:
+                        self.grid_np[y_start:y_end, x] = 0
 
     def reset(self):
-        """重置仿真器"""
+        """
+        重置仿真器 (适配网格迷宫生成)
+        """
         self.time = 0.0
         self.steps = 0
         self.event_log = []
         
-        # 重新生成地图 (每次都随机)
+        # 1. 生成新地图
+        # 这一步会更新 self.map, self.v_walls, self.h_walls, self.spawn_rect_a/b
         self._generate_map()
         
-        # 在固定出生点周围随机撒点
-        # A 队
-        for i in range(self.n_a):
-            # 简单的拒绝采样，确保不生在墙里
-            for _ in range(100):
-                rx = np.random.uniform(-3, 3)
-                ry = np.random.uniform(-3, 3)
-                x = self.spawn_center_a[0] + rx
-                y = self.spawn_center_a[1] + ry
-                # 检查边界和墙
-                ix, iy = int(x), int(y)
-                if 0 < ix < CFG.W and 0 < iy < CFG.H and self.grid_np[iy, ix] == 0:
-                    self.state[i, 0] = x
-                    self.state[i, 1] = y
-                    break
+        # 2. 在网格房间内生成智能体
+        # 此时 self.spawn_rect_a 格式为 (x, y, w, h)
+        # 我们需要在矩形内部保留一点边距(padding)，避免贴墙出生
+        padding = 1.5 
         
-        # B 队 (索引从 n_a 开始)
+        # --- 生成 A 队 ---
+        ax, ay, aw, ah = self.spawn_rect_a
+        for i in range(self.n_a):
+            # 在矩形范围内随机 (x ~ x+w, y ~ y+h)
+            # 确保房间够大，如果房间极小(例如10x10)，padding后还有空间
+            safe_w = max(1.0, aw - 2 * padding)
+            safe_h = max(1.0, ah - 2 * padding)
+            
+            self.state[i, 0] = ax + padding + np.random.uniform(0, safe_w)
+            self.state[i, 1] = ay + padding + np.random.uniform(0, safe_h)
+        
+        # --- 生成 B 队 ---
+        bx, by, bw, bh = self.spawn_rect_b
         for i in range(self.n_a, self.agents_total):
-            for _ in range(100):
-                rx = np.random.uniform(-3, 3)
-                ry = np.random.uniform(-3, 3)
-                x = self.spawn_center_b[0] + rx
-                y = self.spawn_center_b[1] + ry
-                ix, iy = int(x), int(y)
-                if 0 < ix < CFG.W and 0 < iy < CFG.H and self.grid_np[iy, ix] == 0:
-                    self.state[i, 0] = x
-                    self.state[i, 1] = y
-                    break
+            safe_w = max(1.0, bw - 2 * padding)
+            safe_h = max(1.0, bh - 2 * padding)
+            
+            self.state[i, 0] = bx + padding + np.random.uniform(0, safe_w)
+            self.state[i, 1] = by + padding + np.random.uniform(0, safe_h)
 
-        # 初始化其他状态 (theta, hp 等)
+        # 3. 初始化物理和战斗状态
+        cx, cy = CFG.W / 2, CFG.H / 2
         for i in range(self.agents_total):
             is_a = i < self.n_a
+            
+            # 计算初始朝向：让他们面向地图中心，这样双方容易相遇
+            mx, my = self.state[i, 0], self.state[i, 1]
+            target_angle = math.atan2(cy - my, cx - mx)
+            
             self.state[i, 2] = 0 # vx
             self.state[i, 3] = 0 # vy
-            # 让 A 队朝向 B 队大致方向，B 队反之，或者简单地 A 朝右(0) B 朝左(pi)
-            self.state[i, 4] = 0 if is_a else np.pi 
-            self.state[i, 5] = 0 
-            self.state[i, 6] = 1.0 
-            self.state[i, 7] = CFG.MAG_SIZE 
-            self.state[i, 8] = CFG.MAX_MAGS 
-            self.state[i, 9] = 0 
-            self.state[i, 10] = CFG.SIGMA_STABLE 
-            self.state[i, 11] = 0 if is_a else 1 
+            self.state[i, 4] = target_angle
+            self.state[i, 5] = 0 # omega
+            self.state[i, 6] = 1.0 # hp
+            self.state[i, 7] = CFG.MAG_SIZE # ammo
+            self.state[i, 8] = CFG.MAX_MAGS # spare mags
+            self.state[i, 9] = 0 # reload timer
+            self.state[i, 10] = CFG.SIGMA_STABLE # recoil/spread
+            self.state[i, 11] = 0 if is_a else 1 # team
 
         return self._get_observations()
 
@@ -447,64 +515,84 @@ class CQBSimulator:
 
     def _update_physics(self):
         """
-        物理更新：根据当前状态中的速度值更新智能体的位置和角度
-        
-        该函数使用 state 中已更新的速度值（vx, vy, omega）进行物理模拟，
-        包括位置更新、角度更新和碰撞检测。速度值应在调用此函数前通过
-        _update_status 函数从动作中计算并更新到 state 中。
-        
-        物理更新流程：
-        1. 根据当前速度更新位置和角度
-        2. 检测与地图障碍物的碰撞
-        3. 更新存活智能体的位置和角度（碰撞的智能体位置不变）
+        物理更新：
+        1. 采用 AABB (轴对齐包围盒) 碰撞检测，矩形不随朝向旋转。
+        2. 实现 Axis-Independent Movement (分轴移动) 以支持贴墙滑动。
         """
-        # 使用 state 中的速度值进行物理更新
+        # 获取当前状态
+        # 注意：这里我们获取的是值的拷贝或引用，后续直接更新 self.state
         vx = self.state[:, 2]
         vy = self.state[:, 3]
         omega = self.state[:, 5]
         theta = self.state[:, 4]
-        
-        # 位置更新
-        x_new = self.state[:, 0] + vx * CFG.DT
-        y_new = self.state[:, 1] + vy * CFG.DT
-        theta_new = (theta + omega * CFG.DT) % (2 * np.pi)
-        
-        # 碰撞检测：考虑智能体的碰撞半径
-        # 检查智能体中心周围半径范围内的网格点是否有障碍物
-        collided = torch.zeros(self.agents_total, dtype=torch.bool, device=CFG.DEVICE)
         radius = CFG.RADIUS
         
-        # 对每个智能体进行碰撞检测
+        # 旋转更新 (旋转不受阻挡)
+        theta_new = (theta + omega * CFG.DT) % (2 * np.pi)
+        
+        # 定义内部函数：检查特定位置是否发生 AABB 碰撞
+        # box_center: (x, y)
+        # return: True if collision detected
+        def check_collision(cx, cy, agent_idx):
+            # 智能体的 AABB 边界
+            # 由于是外接矩形，半宽和半高都等于 Radius
+            min_ax = cx - radius
+            max_ax = cx + radius
+            min_ay = cy - radius
+            max_ay = cy + radius
+            
+            # 计算需要检查的网格索引范围
+            # 向下取整获取左/上边界所在的格子，向上取整获取右/下边界
+            start_gx = max(0, int(math.floor(min_ax)))
+            end_gx = min(CFG.W - 1, int(math.floor(max_ax)))
+            start_gy = max(0, int(math.floor(min_ay)))
+            end_gy = min(CFG.H - 1, int(math.floor(max_ay)))
+            
+            # 遍历覆盖到的所有网格
+            for gy in range(start_gy, end_gy + 1):
+                for gx in range(start_gx, end_gx + 1):
+                    # 如果该网格是墙壁 (map值 > 0.5)
+                    if self.map[gy, gx] > 0.5:
+                        # 只要碰到了任何一个墙壁格子，就是发生了碰撞
+                        # 因为我们在用 AABB vs Grid，且 Grid 也是 AABB
+                        # 只要 Grid 索引在 Agent AABB 范围内，且 Grid 是墙，即为重叠
+                        return True
+            return False
+
+        # 对每个智能体分别进行物理更新
         for i in range(self.agents_total):
-            x, y = x_new[i].item(), y_new[i].item()
+            if self.state[i, 6] <= 0: continue # 跳过死者
             
-            # 计算需要检查的网格范围（中心 ± 半径）
-            x_min = max(0, int(x - radius))
-            x_max = min(CFG.W - 1, int(x + radius) + 1)
-            y_min = max(0, int(y - radius))
-            y_max = min(CFG.H - 1, int(y + radius) + 1)
+            curr_x = self.state[i, 0].item()
+            curr_y = self.state[i, 1].item()
             
-            # 检查范围内是否有障碍物，且距离中心小于等于半径
-            for gx in range(x_min, x_max):
-                for gy in range(y_min, y_max):
-                    # 计算网格中心到智能体中心的距离
-                    grid_center_x = gx + 0.5
-                    grid_center_y = gy + 0.5
-                    dist = math.sqrt((grid_center_x - x)**2 + (grid_center_y - y)**2)
-                    
-                    # 如果网格是障碍物且距离小于等于半径，则发生碰撞
-                    if self.map[gy, gx] > 0.5 and dist <= radius:
-                        collided[i] = True
-                        break
-                if collided[i]:
-                    break
-        
-        alive = self.state[:, 6] > 0
-        update_mask = alive & (~collided)
-        
-        self.state[update_mask, 0] = x_new[update_mask]
-        self.state[update_mask, 1] = y_new[update_mask]
-        self.state[alive, 4] = theta_new[alive]
+            # --- X 轴尝试移动 ---
+            next_x = curr_x + vx[i].item() * CFG.DT
+            # 检查：如果在 (next_x, curr_y) 位置是否会撞墙？
+            if not check_collision(next_x, curr_y, i):
+                # 没撞：应用 X 轴位移
+                self.state[i, 0] = next_x
+            else:
+                # 撞了：X 轴保持不变 (curr_x)，实现“挡住”
+                # 可选：将撞墙方向的速度清零，防止物理动量累积，但在简单移动中非必须
+                pass 
+                
+            # --- Y 轴尝试移动 (滑动逻辑) ---
+            # 注意：这里使用 update 过的 X (如果X移动成功) 或者旧的 X (如果X撞墙)
+            # 这就是“滑动”的关键：X被挡住了，但Y还能动。
+            current_x_after_step1 = self.state[i, 0].item()
+            
+            next_y = curr_y + vy[i].item() * CFG.DT
+            # 检查：如果在 (current_x, next_y) 位置是否会撞墙？
+            if not check_collision(current_x_after_step1, next_y, i):
+                # 没撞：应用 Y 轴位移
+                self.state[i, 1] = next_y
+            else:
+                # 撞了：Y 轴保持不变
+                pass
+            
+            # --- 更新朝向 ---
+            self.state[i, 4] = theta_new[i]
 
     def _update_status(self, actions):
         """
@@ -595,153 +683,152 @@ class CQBSimulator:
         
     def _detect_ray_collision(self, ps, pt):
         """
-        射线检测：检查从起点到终点的射线是否被障碍物阻挡
-        
-        使用 Bresenham 直线算法精确遍历射线经过的所有网格单元，比采样方法更精确且更快。
-        该算法直接遍历射线经过的每个网格单元，避免浮点数采样，确保不遗漏任何障碍物。
-        
-        Args:
-            ps (torch.Tensor): 射线起点坐标，形状为 (2,)，表示 (x, y) 位置
-            pt (torch.Tensor): 射线终点坐标，形状为 (2,)，表示 (x, y) 位置
-        
-        Returns:
-            bool: 如果射线被障碍物阻挡或超出边界返回 True，否则返回 False
+        射线检测：使用 DDA (Digital Differential Analyzer) 算法
+        该算法能精确遍历射线经过的每一个网格，彻底解决穿墙问题。
         """
-        # 转换为整数网格坐标
-        x0 = int(ps[0].item())
-        y0 = int(ps[1].item())
-        x1 = int(pt[0].item())
-        y1 = int(pt[1].item())
+        # 1. 提取起点和终点的连续坐标
+        x1, y1 = ps[0].item(), ps[1].item()
+        x2, y2 = pt[0].item(), pt[1].item()
+
+        # 2. 转换为网格坐标 (整数)
+        map_x = int(math.floor(x1))
+        map_y = int(math.floor(y1))
+        end_map_x = int(math.floor(x2))
+        end_map_y = int(math.floor(y2))
+
+        # 3. 计算射线方向和距离
+        ray_dir_x = x2 - x1
+        ray_dir_y = y2 - y1
+        dist = math.sqrt(ray_dir_x**2 + ray_dir_y**2) + 1e-6 # 防止除零
         
-        # 距离为0，视为同一点
-        if x0 == x1 and y0 == y1:
-            return False
+        # 归一化方向向量
+        ray_dir_x /= dist
+        ray_dir_y /= dist
+
+        # 4. DDA 初始化
+        # delta_dist: 射线移动一个网格单位在 X 或 Y 方向上所需的实际距离
+        delta_dist_x = abs(1.0 / (ray_dir_x + 1e-9))
+        delta_dist_y = abs(1.0 / (ray_dir_y + 1e-9))
+
+        # step: 步进方向 (+1 或 -1)
+        # side_dist: 从当前位置到下一个网格边界的距离
+        if ray_dir_x < 0:
+            step_x = -1
+            side_dist_x = (x1 - map_x) * delta_dist_x
+        else:
+            step_x = 1
+            side_dist_x = (map_x + 1.0 - x1) * delta_dist_x
+
+        if ray_dir_y < 0:
+            step_y = -1
+            side_dist_y = (y1 - map_y) * delta_dist_y
+        else:
+            step_y = 1
+            side_dist_y = (map_y + 1.0 - y1) * delta_dist_y
+
+        # 5. DDA 步进循环
+        # 最大步数设为长宽之和即可覆盖全图
+        max_steps = CFG.W + CFG.H
         
-        # 使用 Bresenham 直线算法遍历所有经过的网格单元
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        
-        x, y = x0, y0
-        first_step = True  # 标记是否为第一步（起点）
-        
-        # 遍历从起点到终点的所有网格单元
-        while True:
-            # 跳过起点（避免检查射击者自身位置）
-            if not first_step:
-                # 边界检查
-                if x < 0 or x >= CFG.W or y < 0 or y >= CFG.H:
-                    return True  # 超出边界视为阻挡
-                
-                # 检查是否为障碍物
-                if self.map[y, x] > 0.5:
-                    return True  # 被障碍物阻挡
+        for _ in range(max_steps):
+            # --- 核心检查 ---
+            # 如果当前网格是墙壁，返回 True (发生碰撞)
+            # 先做边界检查防止索引越界
+            if 0 <= map_x < CFG.W and 0 <= map_y < CFG.H:
+                if self.map[map_y, map_x] > 0.5:
+                    return True 
             
-            # 到达终点
-            if x == x1 and y == y1:
+            # 如果到达了目标所在的网格，说明中间没有障碍物，循环结束
+            if map_x == end_map_x and map_y == end_map_y:
                 break
             
-            first_step = False
-            
-            # Bresenham 算法的下一步
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-        
-        return False  # 路径畅通
+            # --- 步进 ---
+            # 总是向距离最近的那个轴移动一步
+            if side_dist_x < side_dist_y:
+                side_dist_x += delta_dist_x
+                map_x += step_x
+            else:
+                side_dist_y += delta_dist_y
+                map_y += step_y
+                
+        return False # 路径畅通
     
     def _resolve_combat(self, actions):
-        """
-        战斗解析：处理所有智能体的射击动作，计算命中判定和伤害
-        
-        该函数处理每个智能体的射击指令，包括射击条件检查、弹道模拟、命中判定和伤害计算。
-        对于每个射击者，系统会：
-        1. 检查射击条件（存活、有弹药、不在换弹、满足射速限制）
-        2. 根据当前散布值生成带随机误差的射击方向
-        3. 检测所有可能命中的目标（考虑横向距离、障碍物阻挡）
-        4. 选择最近的命中目标并计算伤害
-        5. 更新射击者的弹药、散布值和目标的生命值
-        
-        Args:
-            actions (torch.Tensor): 所有智能体的动作张量，形状为 (n_agents, 5)
-                - actions[:, 3]: 射击指令，> 0.5 表示开火
-                - actions[:, 4]: 换弹指令，> 0.5 表示换弹
-        
-        Returns:
-            List[Dict]: 命中事件日志列表，每个元素包含：
-                - 'shooter': 射击者索引
-                - 'target': 被命中目标索引
-                - 'damage': 造成的伤害值
-                - 'loc': 命中位置坐标 [x, y]
-        """
+        """战斗判定与结算 (修正贴墙无法命中bug版)"""
         hits_log = []
         fire_cmd = actions[:, 3] > 0.5
-        # 射击条件检查：
-        # - state[:, 6] (h_i): 当前生命值，> 0 表示存活
-        # - state[:, 7] (c_i): 当前弹匣剩余子弹，> 0 表示有弹药
-        # - state[:, 9] (r_timer): 换弹倒计时，<= 0 表示不在换弹状态
-        # - 射速限制：距离上次射击时间 >= 1/FIRE_RATE
         can_fire = (self.state[:, 6] > 0) & \
                    (self.state[:, 7] > 0) & \
                    (self.state[:, 9] <= 0) & \
                    ((self.time - self.last_shot_time) >= (1.0/CFG.FIRE_RATE))
         
         shooters = torch.nonzero(fire_cmd & can_fire).squeeze()
-        if shooters.numel() == 0:
-            return hits_log
+        if shooters.numel() == 0: return hits_log
         if shooters.dim() == 0: shooters = shooters.unsqueeze(0)
 
         for s_idx in shooters:
-            self.state[s_idx, 7] -= 1 # 余弹量减少1
+            self.state[s_idx, 7] -= 1
             self.last_shot_time[s_idx] = self.time
             
-            noise = np.random.normal(0, self.state[s_idx, 10].item()) # 随机生成射击散步误差
-            shoot_angle = self.state[s_idx, 4].item() + noise # 射击散步误差叠加射手的朝向为最终射击方向
-
-            self.state[s_idx, 10] = min(self.state[s_idx, 10] + CFG.DELTA_SIGMA, CFG.SIGMA_MAX) # 增加下一次开火的射击散步方差
+            noise = np.random.normal(0, self.state[s_idx, 10].item())
+            shoot_angle = self.state[s_idx, 4].item() + noise
+            self.state[s_idx, 10] = min(self.state[s_idx, 10] + CFG.DELTA_SIGMA, CFG.SIGMA_MAX)
             
-            ps = self.state[s_idx, 0:2] # 射手位置
-            direction = torch.tensor([math.cos(shoot_angle), math.sin(shoot_angle)], device=CFG.DEVICE) # 将射击方向角转换为方向向量
+            ps = self.state[s_idx, 0:2]
+            direction = torch.tensor([math.cos(shoot_angle), math.sin(shoot_angle)], device=CFG.DEVICE)
             
             targets = torch.arange(self.agents_total, device=CFG.DEVICE)
-            targets = targets[targets != s_idx] # 排除射手本身
+            targets = targets[targets != s_idx]
             
             min_dist = 9999
             hit_target = -1
             hit_lateral_distance = 0
             
             for t_idx in targets:
-                if self.state[t_idx, 6] <= 0: continue # 跳过已经阵亡的目标
+                if self.state[t_idx, 6] <= 0: continue
                 
-                pt = self.state[t_idx, 0:2] # 目标的位置
-                v_st = pt - ps # 目标与射手的相对位置
-                proj_t = torch.dot(v_st, direction) # 目标在射手的射击方向上的投影距离
+                pt = self.state[t_idx, 0:2]
+                v_st = pt - ps
                 
-                if proj_t < 0: continue # 跳过位于射手后方的目标
+                # 目标距离
+                dist_st = torch.norm(v_st)
                 
-                lateral_offset = v_st - proj_t * direction  # 垂直于射击方向的横向偏移向量
-                lateral_distance = torch.norm(lateral_offset)  # 目标到射击路径的横向距离
+                # 投影距离
+                proj_t = torch.dot(v_st, direction)
                 
-                if lateral_distance < CFG.HIT_RADIUS: # 如果横向距离小于命中半径，则继续判断其余命中判定条件
-                    # 检查是否有障碍物阻挡
-                    if self._detect_ray_collision(ps, pt):
-                        continue  # 被障碍物阻挡，跳过此目标
+                if proj_t < 0: continue
+                
+                lateral_offset = v_st - proj_t * direction 
+                lateral_distance = torch.norm(lateral_offset) 
+                
+                if lateral_distance < CFG.HIT_RADIUS: 
+                    # --- 核心修复开始 ---
+                    # 问题：如果直接检测 ps 到 pt，当 pt 紧贴墙壁时，DDA可能会检测到墙壁而判定阻挡。
+                    # 解决：将检测终点从“目标中心”向“射手”回缩一段距离（身体半径的80%）。
+                    # 这样射线只需到达目标“体表”即可，忽略目标背后或身下的墙。
                     
-                    if proj_t < min_dist: # 记录下最靠近射手的命中对象
+                    # 计算回缩比例。如果距离很近（贴脸），则不回缩（比例为0）
+                    pullback_dist = CFG.HIT_RADIUS * 0.8
+                    if dist_st > pullback_dist:
+                        check_ratio = 1.0 - (pullback_dist / dist_st)
+                        # 使用线性插值计算新的检测终点
+                        pt_check = ps + v_st * check_ratio
+                    else:
+                        # 距离极近，直接检测到中心（此时基本不会有墙阻挡）
+                        pt_check = pt
+                        
+                    if self._detect_ray_collision(ps, pt_check): continue
+                    # --- 核心修复结束 ---
+                    
+                    if proj_t < min_dist:
                         min_dist = proj_t
                         hit_target = t_idx
                         hit_lateral_distance = lateral_distance
             
             if hit_target != -1:
-                damage = CFG.DMG_MAX * math.exp(-(hit_lateral_distance.item()**2) / (2 * CFG.DMG_WIDTH**2)) # 根据命中位置与目标中心的距离计算伤害值
-                self.state[hit_target, 6] = max(0, self.state[hit_target, 6] - damage) # 扣除目标的血量
-                hits_log.append({ # 记录下此次事件
+                damage = CFG.DMG_MAX * math.exp(-(hit_lateral_distance.item()**2) / (2 * CFG.DMG_WIDTH**2))
+                self.state[hit_target, 6] = max(0, self.state[hit_target, 6] - damage)
+                hits_log.append({
                     'shooter': s_idx.item(),
                     'target': hit_target.item(),
                     'damage': damage,
@@ -767,6 +854,7 @@ class CQBSimulator:
                 如果智能体已阵亡，则对应的值为 None
         """
         obs_dict = {}
+        half_L = CFG.L // 2
         for i in range(self.agents_total):
             if self.state[i, 6] <= 0: # 已经阵亡的目标是不可见的
                 obs_dict[i] = None
@@ -782,11 +870,30 @@ class CQBSimulator:
             o_self[7] = 1.0 if o_self[7] > 0 else 0.0 
             
             cx, cy = int(self.state[i, 0]), int(self.state[i, 1])
-            half_L = CFG.L // 2
-            padded_map = torch.nn.functional.pad(self.map, (half_L, half_L, half_L, half_L), value=1)
-            x_start = cx
-            y_start = cy
-            local_grid = padded_map[y_start:y_start+CFG.L, x_start:x_start+CFG.L]
+            # 计算以智能体为中心需要截取的区域
+            # 左上角坐标：中心坐标减去 L//2
+            x_start = cx - half_L
+            y_start = cy - half_L
+            
+            # 计算需要的 padding 大小（确保不会超出边界）
+            pad_left = max(0, -x_start)
+            pad_right = max(0, x_start + CFG.L - CFG.W)
+            pad_top = max(0, -y_start)
+            pad_bottom = max(0, y_start + CFG.L - CFG.H)
+            
+            # 对地图进行 padding，超出部分用 1（墙）填充
+            padded_map = torch.nn.functional.pad(
+                self.map, 
+                (pad_left, pad_right, pad_top, pad_bottom), 
+                value=1
+            )
+            
+            # 调整截取坐标（加上 padding 的偏移）
+            x_start_padded = x_start + pad_left
+            y_start_padded = y_start + pad_top
+            
+            # 截取 LxL 的局部地图
+            local_grid = padded_map[y_start_padded:y_start_padded+CFG.L, x_start_padded:x_start_padded+CFG.L]
             o_spatial = local_grid.flatten() # 局部坐标系下的地图
             
             # 对其它智能体进行观测（敌方和友方）
@@ -794,7 +901,6 @@ class CQBSimulator:
             enemy_obs = []
             my_team = self.state[i, 11]
             my_pos = self.state[i, 0:2]
-            my_theta = self.state[i, 4]
             
             for j in range(self.agents_total):
                 if i == j: continue # 跳过本身
@@ -818,7 +924,6 @@ class CQBSimulator:
                     
                     # 1. 检查所有同阵营友军是否能看见该敌人（共享视野）
                     is_visible_by_any_teammate = False
-                    half_L = CFG.L // 2
                     
                     # 遍历所有同阵营友军
                     for teammate_idx in range(self.agents_total):

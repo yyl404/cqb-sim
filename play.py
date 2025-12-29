@@ -6,20 +6,23 @@ import json
 import argparse
 import math
 from tqdm import tqdm
+import mediapy
 
+# 引入simulator中的类和配置
 from simulator import CQBSimulator, CFG
-from net import CQBTransformerPolicy
 
 # ==========================================
-# 1. 渲染器 (Visualizer)
+# 1. 渲染器 (Visualizer) - 修改版
 # ==========================================
 class CQBRenderer:
+    # --- 特效配置 ---
+    SHOT_DURATION = 0.5       # 线条持续时间 (秒)
+    SHOT_VIS_LENGTH = 30.0    # 最大视觉长度 (米)
+    SHOT_FADE_DISTANCE = 1.5  # 靠近射手的淡出/透明遮罩半径 (米)
+    SHOT_COLOR = (0, 255, 255) # 黄色 (BGR)
+
     def __init__(self, map_data, scale=8):
-        """
-        Args:
-            map_data: shape (H, W), 0 for floor, 1 for wall. Can be numpy or tensor.
-            scale: pixel scale factor
-        """
+        # 处理地图数据
         if isinstance(map_data, torch.Tensor):
             self.map = map_data.cpu().numpy()
         else:
@@ -28,65 +31,200 @@ class CQBRenderer:
         self.H, self.W = self.map.shape
         self.scale = scale
         
-        # 预绘制背景
-        # 1. 先在原始尺寸上绘制
+        # 1. 预绘制背景
         small_bg = np.zeros((self.H, self.W, 3), dtype=np.uint8)
         small_bg[self.map == 0] = (230, 230, 230) # 地板: 浅灰
         small_bg[self.map == 1] = (60, 60, 60)    # 墙壁: 深灰
         
-        # 2. 使用最近邻插值放大到目标尺寸 (保持边缘锐利)
+        # 2. 放大到渲染尺寸
         self.bg = cv2.resize(
             small_bg, 
             (self.W * self.scale, self.H * self.scale), 
             interpolation=cv2.INTER_NEAREST
         )
-        
-        # 强制绘制网格线 (可选，让地图看起来更有战术感)
-        # for x in range(0, self.W * scale, scale):
-        #     cv2.line(self.bg, (x, 0), (x, self.H * scale), (220, 220, 220), 1)
-        # for y in range(0, self.H * scale, scale):
-        #     cv2.line(self.bg, (0, y), (self.W * scale, y), (220, 220, 220), 1)
 
-    def render_frame(self, state_list, hits):
+        # 3. 状态追踪变量
+        self.last_ammo = {}    # {agent_id: ammo_count}
+        self.active_shots = [] # [{'start': (x,y), 'end': (x,y), 'time': t}, ...]
+
+    def _cast_ray_to_wall(self, start_pos, theta):
+        """
+        视觉层面的 DDA 射线检测，用于计算击中墙壁的坐标
+        """
+        x1, y1 = start_pos
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        
+        # 最大射程终点
+        x2 = x1 + cos_t * self.SHOT_VIS_LENGTH
+        y2 = y1 + sin_t * self.SHOT_VIS_LENGTH
+
+        # --- DDA 初始化 ---
+        map_x = int(math.floor(x1))
+        map_y = int(math.floor(y1))
+        
+        ray_dir_x = cos_t
+        ray_dir_y = sin_t
+        
+        delta_dist_x = abs(1.0 / (ray_dir_x + 1e-9))
+        delta_dist_y = abs(1.0 / (ray_dir_y + 1e-9))
+
+        if ray_dir_x < 0:
+            step_x = -1
+            side_dist_x = (x1 - map_x) * delta_dist_x
+        else:
+            step_x = 1
+            side_dist_x = (map_x + 1.0 - x1) * delta_dist_x
+
+        if ray_dir_y < 0:
+            step_y = -1
+            side_dist_y = (y1 - map_y) * delta_dist_y
+        else:
+            step_y = 1
+            side_dist_y = (map_y + 1.0 - y1) * delta_dist_y
+
+        # --- DDA 步进 ---
+        # 我们需要记录总距离，以便计算精确撞击点
+        hit = False
+        side = 0 # 0 for x-hit, 1 for y-hit
+        
+        # 限制最大步数，避免死循环
+        max_steps = int(self.SHOT_VIS_LENGTH * 2) 
+        
+        for _ in range(max_steps):
+            # 碰撞检查
+            if 0 <= map_x < self.W and 0 <= map_y < self.H:
+                if self.map[map_y, map_x] > 0.5:
+                    hit = True
+                    break
+            else:
+                # 出界视为撞墙
+                hit = True
+                break
+                
+            # 步进
+            if side_dist_x < side_dist_y:
+                side_dist_x += delta_dist_x
+                map_x += step_x
+                side = 0
+            else:
+                side_dist_y += delta_dist_y
+                map_y += step_y
+                side = 1
+
+        # --- 计算精确终点 ---
+        if hit:
+            # 计算撞墙时的距离
+            # 公式原理：(map_x - x1 + (1-stepX)/2) / ray_dir_x
+            if side == 0:
+                perp_wall_dist = (map_x - x1 + (1 - step_x) / 2) / (ray_dir_x + 1e-9)
+            else:
+                perp_wall_dist = (map_y - y1 + (1 - step_y) / 2) / (ray_dir_y + 1e-9)
+            
+            # 最终坐标
+            hit_x = x1 + ray_dir_x * perp_wall_dist
+            hit_y = y1 + ray_dir_y * perp_wall_dist
+            return (hit_x, hit_y)
+        else:
+            # 没撞墙，返回最大射程处
+            return (x2, y2)
+
+    def render_frame(self, state_list, hits, current_time):
         canvas = self.bg.copy()
         
-        # 绘制击中效果 (短暂的红线或火花)
+        # --- A. 射击特效逻辑 ---
+        
+        # 1. 检测新的开火事件
+        for i, s in enumerate(state_list):
+            current_ammo = s[7]
+            is_reloading = s[9] > 0
+            
+            # 判定开火
+            if i in self.last_ammo:
+                if current_ammo < self.last_ammo[i] and not is_reloading:
+                    start_pos = (s[0], s[1])
+                    theta = s[4]
+                    
+                    # --- 核心修改：确定线条终点 ---
+                    end_pos = None
+                    
+                    # 优先检查：是否命中了智能体？
+                    # 遍历 hits 列表，看当前 shooter 是否造成了伤害
+                    for h in hits:
+                        if h['shooter'] == i:
+                            end_pos = tuple(h['loc']) # 截断在命中点
+                            break
+                    
+                    # 如果没命中人，则检测墙壁 (截断在墙壁)
+                    if end_pos is None:
+                        end_pos = self._cast_ray_to_wall(start_pos, theta)
+                    
+                    self.active_shots.append({
+                        'start_pos': start_pos,
+                        'end_pos': end_pos,
+                        'theta': theta,
+                        'start_time': current_time
+                    })
+            
+            self.last_ammo[i] = current_ammo
+
+        # 2. 清理过期特效
+        self.active_shots = [
+            shot for shot in self.active_shots 
+            if (current_time - shot['start_time']) < self.SHOT_DURATION
+        ]
+
+        # 3. 绘制光束
+        if self.active_shots:
+            overlay = canvas.copy()
+            floor_color = (230, 230, 230)
+            
+            for shot in self.active_shots:
+                sx, sy = shot['start_pos']
+                ex, ey = shot['end_pos'] # 使用已计算好的终点
+                
+                # 转为像素坐标
+                cx, cy = int(sx * self.scale), int(sy * self.scale)
+                end_x, end_y = int(ex * self.scale), int(ey * self.scale)
+                
+                # a. 绘制黄色实线 (使用截断后的终点)
+                cv2.line(overlay, (cx, cy), (end_x, end_y), self.SHOT_COLOR, 2)
+                
+                # b. 绘制靠近射手的遮罩
+                mask_radius = int(self.SHOT_FADE_DISTANCE * self.scale)
+                cv2.circle(overlay, (cx, cy), mask_radius, floor_color, -1)
+
+            # c. 混合图层
+            alpha = 0.8
+            cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+
+        # --- B. 绘制击中点 ---
         for hit in hits:
-            # 由于日志里只记录了击中者的ID和被击中者的位置，
-            # 为了画线，我们需要知道射击者的位置。
-            # 但 state_list 是当前帧的状态。
-            # 这里简化处理：只在被击中位置画一个爆炸标记
             target_loc = hit['loc']
             tx, ty = int(target_loc[0] * self.scale), int(target_loc[1] * self.scale)
-            cv2.circle(canvas, (tx, ty), 4, (0, 0, 255), -1) # 红色命中点
-            cv2.circle(canvas, (tx, ty), 8, (0, 165, 255), 1) # 橙色扩散圈
+            cv2.circle(canvas, (tx, ty), 4, (0, 0, 255), -1) 
+            cv2.circle(canvas, (tx, ty), 8, (0, 165, 255), 1)
 
-        # 绘制智能体
+        # --- C. 绘制智能体 ---
         for i, s in enumerate(state_list):
-            # s 结构: [x, y, vx, vy, theta, omega, hp, c, n, r, sigma, team]
             x, y = s[0], s[1]
             theta = s[4]
             hp = s[6]
             team = int(s[11])
             is_reloading = s[9] > 0
             
+            cx, cy = int(x * self.scale), int(y * self.scale)
+            
+            # 1. 尸体
             if hp <= 0: 
-                # 绘制尸体 (灰色叉叉)
-                cx, cy = int(x * self.scale), int(y * self.scale)
                 r = int(CFG.RADIUS * self.scale)
                 cv2.line(canvas, (cx-r, cy-r), (cx+r, cy+r), (150, 150, 150), 2)
                 cv2.line(canvas, (cx+r, cy-r), (cx-r, cy+r), (150, 150, 150), 2)
                 continue 
             
-            cx, cy = int(x * self.scale), int(y * self.scale)
-            
-            # 阵营颜色 (BGR)
-            # Team 0 (Red): (50, 50, 200)
-            # Team 1 (Blue): (200, 100, 50)
             color = (50, 50, 220) if team == 0 else (220, 150, 50)
             
-            # 1. 视锥 (FOV) - 半透明扇形
-            # 为了性能，这里只画两条线表示视野范围
+            # 2. 视锥
             fov_len = 30
             fov_l = theta - CFG.FOV / 2
             fov_r = theta + CFG.FOV / 2
@@ -95,43 +233,39 @@ class CQBRenderer:
             rx = int(cx + math.cos(fov_r) * fov_len)
             ry = int(cy + math.sin(fov_r) * fov_len)
             
-            overlay = canvas.copy()
-            cv2.line(overlay, (cx, cy), (lx, ly), (200, 200, 200), 1)
-            cv2.line(overlay, (cx, cy), (rx, ry), (200, 200, 200), 1)
-            cv2.addWeighted(overlay, 0.3, canvas, 0.7, 0, canvas)
+            cv2.line(canvas, (cx, cy), (lx, ly), (200, 200, 200), 1)
+            cv2.line(canvas, (cx, cy), (rx, ry), (200, 200, 200), 1)
 
-            # 2. 身体
+            # 3. 身体
             radius = int(CFG.RADIUS * self.scale)
             cv2.circle(canvas, (cx, cy), radius, color, -1)
-            cv2.circle(canvas, (cx, cy), radius, (0, 0, 0), 1) # 黑色描边
+            cv2.circle(canvas, (cx, cy), radius, (0, 0, 0), 1)
             
-            # 3. 朝向指示器
+            # 4. 朝向
             ex = int(cx + math.cos(theta) * radius * 1.5)
             ey = int(cy + math.sin(theta) * radius * 1.5)
             cv2.line(canvas, (cx, cy), (ex, ey), (0, 0, 0), 2)
             
-            # 4. 信息状态 (血条 & 换弹)
-            # 血条背景
+            # 5. 血条与状态
             bar_w = 24
             bar_h = 4
             bx, by = cx - bar_w//2, cy - radius - 8
             cv2.rectangle(canvas, (bx, by), (bx + bar_w, by + bar_h), (50, 50, 50), -1)
-            # 血条前景 (绿->红)
             hp_w = int(bar_w * hp)
             hp_color = (0, 255, 0) if hp > 0.5 else (0, 0, 255)
             cv2.rectangle(canvas, (bx, by), (bx + hp_w, by + bar_h), hp_color, -1)
             
             if is_reloading:
-                cv2.putText(canvas, "RELOAD", (bx, by - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+                cv2.putText(canvas, "R", (bx, by - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
 
         return canvas
 
 # ==========================================
-# 2. 辅助函数
+# 2. 辅助函数 (Obs处理)
 # ==========================================
 def batch_obs(obs_list, device):
     """
-    推理用的 Batch 处理，从观测字典列表生成 Tensor Batch
+    将观测字典列表转换为Tensor Batch (如果需要接入神经网络)
     """
     if not obs_list: return None
     batch = {'self': [], 'spatial': [], 'team': [], 'enemy': []}
@@ -158,91 +292,102 @@ def batch_obs(obs_list, device):
     return batch
 
 # ==========================================
-# 3. 核心功能：实时对战
+# 3. 运行逻辑 (Live & Replay)
 # ==========================================
+
 def run_live(args):
+    """
+    实时仿真模式
+    """
     print(f"Initializing Simulation on {CFG.DEVICE}...")
     env = CQBSimulator(n_a=args.n_agents, n_b=args.n_agents)
     obs_dict = env.reset()
     
-    # 加载模型
-    print(f"Loading model from {args.model_path}...")
-    policy = CQBTransformerPolicy(action_dim=5).to(CFG.DEVICE)
-    if os.path.exists(args.model_path):
-        policy.load_state_dict(torch.load(args.model_path, map_location=CFG.DEVICE))
-        print("Model loaded successfully.")
-    else:
-        print("Warning: Model file not found, using random weights!")
-    policy.eval()
-    
     # 初始化渲染器
-    renderer = CQBRenderer(env.map.cpu())
-    window_name = "CQB Simulation (Press 'q' to quit)"
+    renderer = None
+    window_name = "CQB Simulation"
+    if not args.headless:
+        renderer = CQBRenderer(env.map.cpu())
+    else:
+        print("Headless mode enabled. No GUI window will be shown.")
     
     steps = 0
     max_steps = 1000
     
-    print("Starting loop...")
+    print("Starting simulation loop...")
+    pbar = tqdm(total=max_steps)
+    
     while True:
-        # 1. 收集观测
+        # 1. 收集存活智能体观测
         active_agents = [i for i, o in obs_dict.items() if o is not None]
         if not active_agents:
-            print("All agents dead.")
+            print("\nAll agents dead.")
             break
             
         obs_list = [obs_dict[i] for i in active_agents]
-        batch_input = batch_obs(obs_list, CFG.DEVICE)
         
-        # 2. 推理
+        # 2. 策略推理 (此处为演示，使用简单的随机/测试策略)
+        # 如果有神经网络，可以在此处调用 batch_obs 和 model.forward
         actions = {}
-        with torch.no_grad():
-            # 获取动作均值 (deterministic)
-            mean, _, _ = policy(batch_input)
-            mean = mean.cpu().numpy()
-            
-            for idx, agent_id in enumerate(active_agents):
-                actions[agent_id] = mean[idx] # 使用确定性策略
+        # mean = torch.zeros([len(obs_list), 5]) 
+        # mean[:, 3] = 1.0 # 取消注释此行可以让所有单位持续开火以测试光束特效
+        
+        # 简单的随机游走 + 随机开火策略用于演示
+        for idx, agent_id in enumerate(active_agents):
+            # [surge, sway, omega, fire, reload]
+            act = np.zeros(5)
+            act[0] = np.random.uniform(0.5, 1.0) # 前进
+            act[2] = np.random.uniform(-0.5, 0.5) # 转向
+            if np.random.rand() > 0.8: # 20%概率开火
+                act[3] = 1.0
+            actions[agent_id] = act
         
         # 3. 环境步进
         obs_dict, frame_data, vanquished, all_vanquished = env.step(actions)
         
         # 4. 渲染
-        img = renderer.render_frame(frame_data['states'], frame_data['hits'])
-        
-        # UI 信息
-        cv2.putText(img, f"Step: {steps}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        cv2.putText(img, f"Red Alive: {sum([1 for i in range(env.n_a) if not vanquished[i]])}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.putText(img, f"Blue Alive: {sum([1 for i in range(env.n_a, env.agents_total) if not vanquished[i]])}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
-
-        cv2.imshow(window_name, img)
-        
-        # 控制帧率 (例如 30fps = 33ms)
-        if cv2.waitKey(30) & 0xFF == ord('q'):
-            break
+        if not args.headless:
+            # 传入 env.time 以计算特效持续时间
+            img = renderer.render_frame(frame_data['states'], frame_data['hits'], env.time)
             
+            # UI 信息
+            cv2.putText(img, f"Step: {steps} Time: {env.time:.2f}s", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+            cv2.imshow(window_name, img)
+            
+            # 按Q退出
+            if cv2.waitKey(33) & 0xFF == ord('q'):
+                print("\nStopped by user.")
+                break
+        
         steps += 1
+        pbar.update(1)
+        
         if all_vanquished or steps >= max_steps:
-            print(f"Game Over at step {steps}")
+            print(f"\nGame Over at step {steps}")
             break
             
-    cv2.destroyAllWindows()
+    pbar.close()
+    if not args.headless:
+        cv2.destroyAllWindows()
     
-    # 5. 保存完整回放 (包含地图)
+    # 保存回放
     if args.save_replay:
         replay_data = {
             "map_h": CFG.H,
             "map_w": CFG.W,
-            "map_data": env.map.cpu().numpy().tolist(), # 保存地图
+            "map_data": env.map.cpu().numpy().tolist(),
             "log": env.event_log
         }
         with open(args.output_file, 'w') as f:
             json.dump(replay_data, f)
-        print(f"Replay saved to {args.output_file}")
+        print(f"Replay successfully saved to {args.output_file}")
 
-# ==========================================
-# 4. 核心功能：录像回放 (渲染为视频)
-# ==========================================
+
 def render_replay(args):
+    """
+    回放渲染模式 (生成视频)
+    """
     if not os.path.exists(args.input_file):
         print(f"Error: Replay file {args.input_file} not found.")
         return
@@ -251,64 +396,53 @@ def render_replay(args):
     with open(args.input_file, 'r') as f:
         replay_data = json.load(f)
     
-    # 兼容性处理：如果 JSON 是旧版本（只有 log list），没有 map
+    # 兼容旧格式
     if isinstance(replay_data, list):
-        print("Warning: Legacy replay format detected (no map data). Rendering on blank map.")
-        map_data = np.zeros((CFG.H, CFG.W)) # 空白地图
+        print("Warning: Legacy format. Using blank map.")
+        map_data = np.zeros((CFG.H, CFG.W))
         logs = replay_data
     else:
         map_data = np.array(replay_data["map_data"])
         logs = replay_data["log"]
     
-    # 初始化渲染器
     renderer = CQBRenderer(map_data)
     
-    # 视频输出配置
-    H, W = map_data.shape
-    render_h, render_w = H * renderer.scale, W * renderer.scale
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output_video, fourcc, 30.0, (render_w, render_h))
-    
     print(f"Rendering {len(logs)} frames to {args.output_video}...")
+    frames = []
     
     for i, frame in enumerate(tqdm(logs)):
-        img = renderer.render_frame(frame['states'], frame['hits'])
+        # 获取当前帧时间，如果没有则按步长计算
+        current_time = frame.get('time', i * CFG.DT)
         
-        # 添加进度条
+        img = renderer.render_frame(frame['states'], frame['hits'], current_time)
+        
         cv2.putText(img, f"Replay: {i}/{len(logs)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
         
-        out.write(img)
-        
-        # 可选：同时也显示窗口
-        if not args.headless:
-            cv2.imshow("Replay Rendering", img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("Rendering aborted.")
-                break
+        # OpenCV (BGR) -> Mediapy (RGB)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        frames.append(img_rgb)
     
-    out.release()
-    cv2.destroyAllWindows()
+    # 保存视频
+    mediapy.write_video(args.output_video, frames, fps=30)
     print("Rendering complete.")
 
-# ==========================================
-# 5. 入口
-# ==========================================
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CQB Simulator Player & Renderer")
-    subparsers = parser.add_subparsers(dest="mode", help="Mode: live or replay", required=True)
+    parser = argparse.ArgumentParser(description="CQB Simulator Player")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
     
-    # 模式 A: 实时对战
-    parser_live = subparsers.add_parser("live", help="Run a live simulation with model")
-    parser_live.add_argument("--model_path", type=str, default="cqb_model.pth", help="Path to model weights")
-    parser_live.add_argument("--n_agents", type=int, default=2, help="Agents per team")
-    parser_live.add_argument("--save_replay", action="store_true", default=True, help="Save replay to json")
-    parser_live.add_argument("--output_file", type=str, default="last_match.json", help="Replay output path")
+    # 模式 A: 实时运行 (Live)
+    parser_live = subparsers.add_parser("live")
+    parser_live.add_argument("--model_path", type=str, default="cqb_model.pth")
+    parser_live.add_argument("--n_agents", type=int, default=4)
+    parser_live.add_argument("--save_replay", action="store_true", default=True)
+    parser_live.add_argument("--output_file", type=str, default="last_match.json")
+    parser_live.add_argument("--headless", action="store_true", help="Run without GUI")
     
-    # 模式 B: 回放渲染
-    parser_replay = subparsers.add_parser("replay", help="Render an existing replay file to video")
-    parser_replay.add_argument("--input_file", type=str, default="last_match.json", help="Path to json replay")
-    parser_replay.add_argument("--output_video", type=str, default="replay.mp4", help="Output video path")
-    parser_replay.add_argument("--headless", action="store_true", help="Don't show window while rendering video")
+    # 模式 B: 回放 (Replay)
+    parser_replay = subparsers.add_parser("replay")
+    parser_replay.add_argument("--input_file", type=str, default="last_match.json")
+    parser_replay.add_argument("--output_video", type=str, default="replay.mp4")
     
     args = parser.parse_args()
     
