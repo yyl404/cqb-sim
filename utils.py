@@ -15,10 +15,20 @@ class CQBConfig:
     # Auto-detect device
     DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Physics Constraints ---
-    V_MAX: float = 3.0      # Max speed (m/s)
+    # --- Physics Constraints (Dynamics) ---
+    V_MAX: float = 3.0      # Max speed limit (m/s) - Soft limit via drag
     OMEGA_MAX: float = 3.0  # Max angular velocity (rad/s)
-    RADIUS: float = 0.5     # Agent collision radius (treated as AABB half-width)
+    
+    # Acceleration Limits (The source of Inertia)
+    ACCEL_MAX: float = 6.0       # Max linear acceleration (m/s^2)
+    ALPHA_MAX: float = 12.0      # Max angular acceleration (rad/s^2)
+    
+    # Drag/Friction (Simulates air resistance/ground friction)
+    # v_new = v_old * (1 - DRAG * DT)
+    LIN_DRAG: float = 2.0   
+    ANG_DRAG: float = 4.0
+    
+    RADIUS: float = 0.5     # Agent collision radius
 
     # --- Shooting & Spread ---
     SIGMA_STABLE: float = 0.05
@@ -65,14 +75,9 @@ def batch_obs(obs_list: List[Dict[str, torch.Tensor]], device: torch.device) -> 
     def pad_sequence(tensor_list: List[torch.Tensor]) -> torch.Tensor:
         """Pads a list of variable-length tensors to the max length in the batch."""
         max_len = max([t.shape[0] for t in tensor_list])
-        if max_len == 0:
-            max_len = 1
+        if max_len == 0: max_len = 1
         
-        if tensor_list and tensor_list[0].numel() > 0:
-            feature_dim = tensor_list[0].shape[1]
-        else:
-            feature_dim = 10 if tensor_list is batch['team'] else 8
-
+        feature_dim = tensor_list[0].shape[1] if (tensor_list and tensor_list[0].numel() > 0) else (10 if tensor_list is batch['team'] else 8)
         padded = torch.zeros((len(tensor_list), max_len, feature_dim), device=device)
         for i, t in enumerate(tensor_list):
             if t.numel() > 0:

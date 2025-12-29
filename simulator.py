@@ -7,7 +7,7 @@ from utils import CFG
 
 
 class CQBSimulator:
-    """GPU-accelerated 2D Multi-Agent CQB Simulator."""
+    """GPU-accelerated 2D Multi-Agent CQB Simulator with Newtonian Dynamics."""
 
     def __init__(self, n_a: int = 2, n_b: int = 2):
         self.n_a = n_a
@@ -18,15 +18,13 @@ class CQBSimulator:
         self.map: torch.Tensor = torch.zeros((CFG.H, CFG.W), device=CFG.DEVICE, dtype=torch.float32)
         self.spawn_rect_a: Optional[Tuple[int, int, int, int]] = None
         self.spawn_rect_b: Optional[Tuple[int, int, int, int]] = None
-        
-        # Generation helpers
         self.v_walls: Optional[np.ndarray] = None
         self.h_walls: Optional[np.ndarray] = None
         
         self._generate_map()
         
         # State Tensor: (N, 12)
-        # 0:x, 1:y, 2:vx, 3:vy, 4:theta, 5:omega, 6:hp, 7:c, 8:n, 9:r_timer, 10:sigma, 11:team
+        # 0:x, 1:y, 2:vx(global), 3:vy(global), 4:theta, 5:omega, 6:hp, 7:c, 8:n, 9:r_timer, 10:sigma, 11:team
         self.state: torch.Tensor = torch.zeros((self.agents_total, 12), device=CFG.DEVICE)
         self.last_shot_time: torch.Tensor = torch.zeros(self.agents_total, device=CFG.DEVICE) - 100.0
         
@@ -41,7 +39,6 @@ class CQBSimulator:
         
         self._generate_map()
         
-        # Vectorized Spawn Logic
         padding = 1.5
         
         ax, ay, aw, ah = self.spawn_rect_a
@@ -66,7 +63,7 @@ class CQBSimulator:
         dy = cy - self.state[:, 1]
         self.state[:, 4] = torch.atan2(dy, dx)
         
-        self.state[:, 2:4] = 0.0      # vx, vy
+        self.state[:, 2:4] = 0.0      # vx, vy (Initial velocity 0)
         self.state[:, 5] = 0.0        # omega
         self.state[:, 6] = 1.0        # hp
         self.state[:, 7] = CFG.MAG_SIZE
@@ -77,6 +74,8 @@ class CQBSimulator:
         return self._get_observations()
 
     def step(self, actions_dict: Dict[int, np.ndarray], reward_fn=None) -> Tuple:
+        # Actions input: [accel_surge, accel_sway, alpha, fire, reload]
+        # All values generally normalized to [-1, 1] (except logic), we scale them inside.
         actions = torch.zeros((self.agents_total, 5), device=CFG.DEVICE)
         
         if actions_dict:
@@ -114,26 +113,54 @@ class CQBSimulator:
         return obs, current_frame_data, vanquished, all_vanquished
 
     def _update_status(self, actions: torch.Tensor):
-        v_surge, v_sway, v_omega = actions[:, 0], actions[:, 1], actions[:, 2]
+        # Newtonian Dynamics
+        # actions: [accel_surge, accel_sway, alpha, fire, reload]
+        
+        # 1. Unpack Acceleration Commands (normalized [-1, 1] presumed, scale to Physics)
+        # Note: In training loop we will scale actions before passing or here. 
+        # Let's assume input is raw scaled physics values for simplicity if Controller is removed?
+        # No, standard RL outputs [-1, 1]. Let's scale here.
+        
+        a_surge = actions[:, 0] * CFG.ACCEL_MAX
+        a_sway = actions[:, 1] * CFG.ACCEL_MAX
+        alpha = actions[:, 2] * CFG.ALPHA_MAX
         
         theta = self.state[:, 4]
         cos_t = torch.cos(theta)
         sin_t = torch.sin(theta)
         
-        vx_new = cos_t * v_surge - sin_t * v_sway
-        vy_new = sin_t * v_surge + cos_t * v_sway
+        # 2. Transform Local Accel to Global Accel
+        ax_global = cos_t * a_surge - sin_t * a_sway
+        ay_global = sin_t * a_surge + cos_t * a_sway
         
-        v_norm = torch.sqrt(vx_new**2 + vy_new**2 + 1e-6)
-        scale = torch.clamp(v_norm, max=1.0) * CFG.V_MAX / (v_norm + 1e-6)
-        
-        vx_new *= scale
-        vy_new *= scale
-        omega_new = torch.clamp(v_omega * CFG.OMEGA_MAX, -CFG.OMEGA_MAX, CFG.OMEGA_MAX)
-        
+        # 3. Integrate Velocity (Euler): v = v + a * dt
         alive_mask = self.state[:, 6] > 0
-        self.state[alive_mask, 2] = vx_new[alive_mask]
-        self.state[alive_mask, 3] = vy_new[alive_mask]
-        self.state[alive_mask, 5] = omega_new[alive_mask]
+        
+        # Linear Velocity Update
+        self.state[alive_mask, 2] += ax_global[alive_mask] * CFG.DT
+        self.state[alive_mask, 3] += ay_global[alive_mask] * CFG.DT
+        
+        # Angular Velocity Update
+        self.state[alive_mask, 5] += alpha[alive_mask] * CFG.DT
+        
+        # 4. Apply Drag/Friction (Damping)
+        # v = v * (1 - decay)
+        lin_decay = 1.0 - CFG.LIN_DRAG * CFG.DT
+        ang_decay = 1.0 - CFG.ANG_DRAG * CFG.DT
+        
+        self.state[alive_mask, 2] *= lin_decay
+        self.state[alive_mask, 3] *= lin_decay
+        self.state[alive_mask, 5] *= ang_decay
+        
+        # 5. Hard Speed Cap (Safety)
+        # Check norm
+        v_norm = torch.sqrt(self.state[:, 2]**2 + self.state[:, 3]**2 + 1e-6)
+        scale_mask = (v_norm > CFG.V_MAX) & alive_mask
+        scale_factor = CFG.V_MAX / v_norm[scale_mask]
+        self.state[scale_mask, 2] *= scale_factor
+        self.state[scale_mask, 3] *= scale_factor
+        
+        self.state[alive_mask, 5] = torch.clamp(self.state[alive_mask, 5], -CFG.OMEGA_MAX, CFG.OMEGA_MAX)
         
         v_sq = self.state[:, 2]**2 + self.state[:, 3]**2
         omega_abs = torch.abs(self.state[:, 5])
@@ -165,6 +192,32 @@ class CQBSimulator:
         trigger_reload = (actions[:, 4] > 0.5) & (self.state[:, 8] > 0) & (~is_reloading) & alive_mask
         self.state[trigger_reload, 9] = CFG.RELOAD_TIME
 
+    def _update_physics(self):
+        # Position update: p = p + v * dt
+        alive_mask = self.state[:, 6] > 0
+        curr_pos = self.state[:, 0:2].clone()
+        velocity = self.state[:, 2:4]
+        
+        # X Update
+        next_x = curr_pos[:, 0] + velocity[:, 0] * CFG.DT
+        collision_x = self._check_collision_vectorized(next_x, curr_pos, axis=0)
+        
+        # Elastic collision response? Or just stop?
+        # For simple top-down, stopping is easier. To prevent sticking, set vel to 0.
+        self.state[alive_mask & ~collision_x, 0] = next_x[alive_mask & ~collision_x]
+        self.state[alive_mask & collision_x, 2] = 0.0 # Stop X velocity on hit
+        
+        # Y Update
+        curr_pos_updated_x = self.state[:, 0:2] 
+        next_y = curr_pos[:, 1] + velocity[:, 1] * CFG.DT
+        collision_y = self._check_collision_vectorized(next_y, curr_pos_updated_x, axis=1)
+        self.state[alive_mask & ~collision_y, 1] = next_y[alive_mask & ~collision_y]
+        self.state[alive_mask & collision_y, 3] = 0.0 # Stop Y velocity on hit
+        
+        # Angle Update
+        theta_new = (self.state[:, 4] + self.state[:, 5] * CFG.DT) % (2 * math.pi)
+        self.state[alive_mask, 4] = theta_new[alive_mask]
+
     def _check_collision_vectorized(self, next_pos: torch.Tensor, current_pos: torch.Tensor, axis: int) -> torch.Tensor:
         test_pos_x = next_pos if axis == 0 else current_pos[:, 0]
         test_pos_y = next_pos if axis == 1 else current_pos[:, 1]
@@ -181,53 +234,25 @@ class CQBSimulator:
         c2 = is_wall(max_x, min_y)
         c3 = is_wall(min_x, max_y)
         c4 = is_wall(max_x, max_y)
-        
         return c1 | c2 | c3 | c4
 
-    def _update_physics(self):
-        alive_mask = self.state[:, 6] > 0
-        curr_pos = self.state[:, 0:2].clone()
-        velocity = self.state[:, 2:4]
-        
-        next_x = curr_pos[:, 0] + velocity[:, 0] * CFG.DT
-        collision_x = self._check_collision_vectorized(next_x, curr_pos, axis=0)
-        self.state[alive_mask & ~collision_x, 0] = next_x[alive_mask & ~collision_x]
-        
-        curr_pos_updated_x = self.state[:, 0:2] 
-        next_y = curr_pos[:, 1] + velocity[:, 1] * CFG.DT
-        collision_y = self._check_collision_vectorized(next_y, curr_pos_updated_x, axis=1)
-        self.state[alive_mask & ~collision_y, 1] = next_y[alive_mask & ~collision_y]
-        
-        theta_new = (self.state[:, 4] + self.state[:, 5] * CFG.DT) % (2 * math.pi)
-        self.state[alive_mask, 4] = theta_new[alive_mask]
-
     def _vectorized_raycast(self, starts: torch.Tensor, ends: torch.Tensor, num_samples: int) -> torch.Tensor:
-        """
-        Vectorized Raycasting.
-        IMPORTANT: num_samples must be sufficient to cover the distance with steps < 0.5m
-        """
         N = starts.shape[0]
-        if N == 0:
-            return torch.zeros(0, dtype=torch.bool, device=CFG.DEVICE)
-            
+        if N == 0: return torch.zeros(0, dtype=torch.bool, device=CFG.DEVICE)
         t = torch.linspace(0, 1, num_samples, device=CFG.DEVICE).view(1, -1, 1)
         points = starts.unsqueeze(1) + (ends - starts).unsqueeze(1) * t
-        
         grid_x = points[:, :, 0].long().clamp(0, CFG.W - 1)
         grid_y = points[:, :, 1].long().clamp(0, CFG.H - 1)
-        
         map_vals = self.map[grid_y, grid_x]
-        is_blocked = (map_vals > 0.5).any(dim=1)
-        return is_blocked
+        return (map_vals > 0.5).any(dim=1)
 
     def _resolve_combat(self, actions: torch.Tensor) -> List[Dict]:
         hits_log = []
-        fire_cmd = actions[:, 3] > 0.5
+        fire_cmd = actions[:, 3] > 0.0 # Continuous > 0 threshold
         can_fire = (self.state[:, 6] > 0) & (self.state[:, 7] > 0) & (self.state[:, 9] <= 0) & ((self.time - self.last_shot_time) >= (1.0/CFG.FIRE_RATE))
         
         shooter_indices = torch.nonzero(fire_cmd & can_fire).squeeze(1)
-        if shooter_indices.numel() == 0:
-            return hits_log
+        if shooter_indices.numel() == 0: return hits_log
 
         self.state[shooter_indices, 7] -= 1
         self.last_shot_time[shooter_indices] = self.time
@@ -256,29 +281,20 @@ class CQBSimulator:
             if len(s_idx_list) > 0:
                 c_ps = p_s[s_idx_list]
                 c_pt = p_t[t_idx_list]
-                c_diff = diff[s_idx_list, t_idx_list]
                 c_dist = dist_st[s_idx_list, t_idx_list]
                 
-                # Ray Pullback
-                pullback = CFG.HIT_RADIUS * 0.8
-                ratio = torch.clamp(1.0 - (pullback / (c_dist + 1e-6)), min=0.0)
-                pt_check = c_ps + c_diff * ratio.unsqueeze(1)
-                
-                # Dynamic Sampling for Combat
                 max_dist = c_dist.max().item()
                 num_samples = int(max_dist * 2.0) + 2
-                
-                is_blocked = self._vectorized_raycast(c_ps, pt_check, num_samples=num_samples)
+                is_blocked = self._vectorized_raycast(c_ps, c_pt, num_samples=num_samples)
                 
                 final_hit_mask = ~is_blocked
                 for i in range(len(final_hit_mask)):
                     if final_hit_mask[i]:
-                        s_real_idx = shooter_indices[s_idx_list[i]].item()
-                        t_real_idx = t_idx_list[i].item()
-                        lat_d = lat_dist[s_idx_list[i], t_idx_list[i]].item()
-                        damage = CFG.DMG_MAX * math.exp(-(lat_d**2) / (2 * CFG.DMG_WIDTH**2))
-                        self.state[t_real_idx, 6] = max(0.0, self.state[t_real_idx, 6].item() - damage)
-                        hits_log.append({'shooter': s_real_idx, 'target': t_real_idx, 'damage': damage, 'loc': self.state[t_real_idx, 0:2].cpu().numpy().tolist()})
+                        s_real = shooter_indices[s_idx_list[i]].item()
+                        t_real = t_idx_list[i].item()
+                        dmg = CFG.DMG_MAX * math.exp(-(lat_dist[s_idx_list[i], t_idx_list[i]].item()**2) / (2 * CFG.DMG_WIDTH**2))
+                        self.state[t_real, 6] = max(0.0, self.state[t_real, 6].item() - dmg)
+                        hits_log.append({'shooter': s_real, 'target': t_real, 'damage': dmg, 'loc': self.state[t_real, 0:2].cpu().numpy().tolist()})
         return hits_log
 
     def _get_observations(self) -> Dict[int, Optional[Dict[str, torch.Tensor]]]:

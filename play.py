@@ -10,7 +10,7 @@ import mediapy
 import numpy as np
 from tqdm import tqdm
 
-from policy import NaiveCQBPolicy
+from policy import NaiveCQBPolicy, RLInferencePolicy
 from simulator import CQBSimulator
 from utils import CFG
 
@@ -218,9 +218,32 @@ def mouse_callback(event, x, y, flags, param):
 def run_live(args: argparse.Namespace) -> None:
     global g_clicked_point
     print(f"Initializing Simulation on {CFG.DEVICE}...")
+    
+    # 1. Initialize Environment
     env = CQBSimulator(n_a=args.n_agents, n_b=args.n_agents)
     obs_dict = env.reset()
-    policies = {i: NaiveCQBPolicy() for i in obs_dict.keys()}
+    
+    # 2. Detect Shapes for RL Policy Init (if needed)
+    # Get shapes from the first alive agent
+    first_agent_id = list(obs_dict.keys())[0]
+    dummy_obs = obs_dict[first_agent_id]
+    obs_shapes = {k: v.shape for k, v in dummy_obs.items()}
+    # Calculate global state dim: Agent Count * 12
+    state_dim = env.agents_total * 12 
+
+    # 3. Initialize Policies based on arguments
+    policies = {}
+    print(f"Equipping agents with policy: {args.policy}")
+    
+    for i in obs_dict.keys():
+        if args.policy == "rl":
+            # Use the model path from arguments, or None if file doesn't exist
+            model_path = args.model_path if os.path.exists(args.model_path) else None
+            if model_path is None:
+                print(f"Warning: Model file '{args.model_path}' not found. Using random weights.")
+            policies[i] = RLInferencePolicy(obs_shapes, state_dim, model_path=model_path)
+        else:
+            policies[i] = NaiveCQBPolicy()
     
     renderer = None
     spectate_id = None
@@ -249,11 +272,16 @@ def run_live(args: argparse.Namespace) -> None:
             spectate_id = clicked_id
             g_clicked_point = None
 
+        # Get Actions
         actions = {}
         active_ids = [i for i, o in obs_dict.items() if o is not None]
         if not active_ids: break
-        for i in active_ids: actions[i] = policies[i].get_action(obs_dict[i])
+        
+        for i in active_ids: 
+            # Policy inference
+            actions[i] = policies[i].get_action(obs_dict[i])
 
+        # Step Environment
         obs_dict, frame_data, _, all_dead = env.step(actions)
 
         if not args.headless and renderer:
@@ -302,11 +330,13 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(dest="mode", required=True)
     
     pl = subparsers.add_parser("live")
-    pl.add_argument("--n_agents", type=int, default=4)
+    pl.add_argument("--n_agents", type=int, default=2) # Default reduced for clearer testing
     pl.add_argument("--max_steps", type=int, default=1000)
     pl.add_argument("--headless", action="store_true")
     pl.add_argument("--save_replay", action="store_true", default=True)
     pl.add_argument("--output_file", type=str, default="last_match.json")
+    pl.add_argument("--policy", type=str, default="naive", choices=["naive", "rl"], help="Choose agent policy: 'naive' (Script) or 'rl' (Neural Network)")
+    pl.add_argument("--model_path", type=str, default="cqb_policy_latest.pth", help="Path to RL policy model weights file (only used when --policy=rl)")
     
     pr = subparsers.add_parser("replay")
     pr.add_argument("--input_file", type=str, default="last_match.json")
