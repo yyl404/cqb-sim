@@ -33,23 +33,23 @@ class EntityEncoder(nn.Module):
         # Shape: (Batch, Seq)
         mask = (torch.abs(x).sum(dim=-1) == 0)
         
-        emb = self.embedding(x)
+        # 修复点：如果一行全被遮罩，MultiheadAttention 会输出 NaN
+        # 我们临时取消第一个元素的遮罩，并在最后将结果置零
+        all_masked = mask.all(dim=1)
+        safe_mask = mask.clone()
+        safe_mask[all_masked, 0] = False
         
-        # Self-Attention
-        # key_padding_mask: True means ignore this position
-        out, _ = self.attn(emb, emb, emb, key_padding_mask=mask)
+        emb = self.embedding(x)
+        out, _ = self.attn(emb, emb, emb, key_padding_mask=safe_mask)
         out = self.ln(out)
         
-        # Pooling: Max Pool over the sequence dimension
-        # We need to mask out the padded values manually before max pooling 
-        # to prevent 0s (or other values) from affecting the max if they are padding.
+        # 使用 masked_fill 代替直接赋值，确保池化时不受干扰
         mask_expanded = mask.unsqueeze(-1).expand_as(out)
-        out[mask_expanded] = -1e9 # Set padding to -infinity
+        out = out.masked_fill(mask_expanded, -1e9)
         
         pooled = torch.max(out, dim=1)[0]
-        
-        # If a sample had ALL padding (no entities), max result is -1e9. Reset to 0.
-        pooled = torch.where(pooled < -1e8, torch.zeros_like(pooled), pooled)
+        # 修复点：将原本全遮罩行的结果重置为 0
+        pooled = pooled.masked_fill(all_masked.unsqueeze(-1), 0.0)
         
         return pooled
 
@@ -178,43 +178,38 @@ class ActorCriticRNN(nn.Module):
             new_hidden: Updated GRU hidden state
             rnn_out: Features for Critic
         """
-        # 1. Encode Features
+        # 观测预处理：归一化
+        # spatial 已经是 0-1, self/team/enemy 需要部分缩放
+        o_self = obs_dict['self'].clone()
+        o_self[:, 1:3] /= 3.0 # vx, vy
+        o_self[:, 3] /= 3.0   # omega
+        
         s_feat = self.spatial_enc(obs_dict['spatial'])
-        self_feat = self.self_enc(obs_dict['self'])
-        team_feat = self.team_enc(obs_dict['team'])
-        enemy_feat = self.enemy_enc(obs_dict['enemy'])
+        self_feat = self.self_enc(o_self)
+        team_feat = self.team_enc(obs_dict['team'] / 100.0) # 缩放位移
+        enemy_feat = self.enemy_enc(obs_dict['enemy'] / 100.0)
         
         features = torch.cat([s_feat, self_feat, team_feat, enemy_feat], dim=-1)
-        
-        # 2. RNN Update
-        # Add seq len dim: (Batch, Feat) -> (Batch, 1, Feat)
         out, new_hidden = self.gru(features.unsqueeze(1), hidden)
-        rnn_out = out.squeeze(1) # (Batch, Hidden)
+        rnn_out = out.squeeze(1)
         
-        # 3. High-Level Movement Distribution
-        # Outputs are desired relative displacements
         mu = torch.tanh(self.actor_mean(rnn_out)) 
-        
-        # Scaling Strategy:
-        # Tanh outputs [-1, 1].
-        # We want the agent to be able to set targets e.g. +/- 2 meters away.
-        # We can perform this scaling here or in the controller.
-        # Let's keep the network output normalized [-1, 1] and scale in the controller.
-        
-        std = torch.exp(self.actor_logstd).expand_as(mu)
+        # 限制 logstd 范围，防止 std 趋于 0 或无穷大
+        logstd = torch.clamp(self.actor_logstd, -2.0, 1.0)
+        std = torch.exp(logstd).expand_as(mu)
         dist_move = Normal(mu, std)
         
-        # 4. Tactics Distribution
-        logits = self.actor_tactics(rnn_out)
-        dist_tactics = Bernoulli(logits=logits)
-        
+        dist_tactics = Bernoulli(logits=self.actor_tactics(rnn_out))
         return (dist_move, dist_tactics), new_hidden, rnn_out
 
     def evaluate_critic(self, global_state: torch.Tensor, rnn_features: torch.Tensor) -> torch.Tensor:
         """
         Estimate Value V(s) using Global State + Agent Memory.
         """
-        cat_input = torch.cat([global_state, rnn_features], dim=-1)
+        # 全局状态归一化 (假设 state 前两列是位置)
+        gs = global_state.clone()
+        gs[:, :2] /= 100.0 
+        cat_input = torch.cat([gs, rnn_features], dim=-1)
         return self.critic_net(cat_input)
 
     @staticmethod

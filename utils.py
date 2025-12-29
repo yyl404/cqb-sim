@@ -1,6 +1,6 @@
 import math
 import torch
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 
 class CQBConfig:
@@ -90,3 +90,65 @@ def batch_obs(obs_list: List[Dict[str, torch.Tensor]], device: torch.device) -> 
         'team': pad_sequence(batch['team']),
         'enemy': pad_sequence(batch['enemy'])
     }
+
+def vectorized_raycast(
+    map_data: torch.Tensor, 
+    starts: torch.Tensor, 
+    ends: torch.Tensor, 
+    num_samples: int, 
+    return_path: bool = False
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    Generalized Vectorized Raycasting on a grid map.
+    
+    Args:
+        map_data: (H, W) tensor, >0.5 implies wall.
+        starts: (N, 2) tensor of (x, y) coordinates.
+        ends: (N, 2) tensor of (x, y) coordinates.
+        num_samples: Number of points to sample along the ray.
+        return_path: 
+            If False (default), returns boolean tensor (N,) indicating if ray is blocked.
+            If True, returns (grid_x, grid_y, visible_mask) for detailed path analysis.
+            
+    Returns:
+        If return_path=False: 
+            is_blocked: (N,) boolean tensor. True if line of sight is obstructed.
+        If return_path=True:
+            grid_x: (N, num_samples) long tensor of X grid indices.
+            grid_y: (N, num_samples) long tensor of Y grid indices.
+            visible_mask: (N, num_samples) boolean tensor. True means the point is visible (before first wall).
+    """
+    N = starts.shape[0]
+    device = starts.device
+    
+    if N == 0:
+        if return_path:
+            return torch.empty(0, device=device), torch.empty(0, device=device), torch.empty(0, device=device)
+        else:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+            
+    # Interpolate points: shape (N, num_samples, 2)
+    t = torch.linspace(0, 1, num_samples, device=device).view(1, -1, 1)
+    points = starts.unsqueeze(1) + (ends - starts).unsqueeze(1) * t
+    
+    # Map coordinates
+    H, W = map_data.shape
+    grid_x = points[:, :, 0].long().clamp(0, W - 1)
+    grid_y = points[:, :, 1].long().clamp(0, H - 1)
+    
+    # Check map values
+    map_vals = map_data[grid_y, grid_x]
+    is_wall = map_vals > 0.5
+    
+    if not return_path:
+        # Simple occlusion check: is there ANY wall along the path?
+        is_blocked = is_wall.any(dim=1)
+        return is_blocked
+    else:
+        # Path analysis: find all visible cells before the first wall
+        # cummax propagates True (wall) downstream. 
+        # [0, 0, 1, 0] -> [0, 0, 1, 1]
+        # visible is ~blocked
+        is_blocked_cum = torch.cummax(is_wall, dim=1)[0]
+        visible_mask = ~is_blocked_cum
+        return grid_x, grid_y, visible_mask
